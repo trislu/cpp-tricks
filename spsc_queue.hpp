@@ -27,36 +27,56 @@ public:
         return wpos.load() - rpos.load();
     }
 
-    void push(T p)
+    void push(const T &elem)
     {
-        /// NOTICE: it works as long as arithmetic on unsigned integers keep exhibiting modulo behavior.
-        while ((uint8_t)(wpos.load() + 1) == rpos.load())
-            ; // blocks when the buffer is full
-        /// SEEALSO: https://cplusplus.com/reference/atomic/atomic/operatorplusplus/
-        buffer[wpos++] = p;
+        // only the producer push can update write position
+        uint8_t _w = wpos.load();
+        // blocks when the buffer is full
+        while (uint8_t(_w + 1) == rpos.load())
+            ;
+        // store elem firstly
+        buffer[_w] = elem;
+        // atomic move write position, so that consumer can detect
+        wpos++;
     }
 
-    T pop()
+    void pop(T &out)
     {
-        while (wpos.load() == rpos.load())
-            ; // blocks when the buffer is full
-        return buffer[rpos++];
+        // only the consumer push can update read position
+        uint8_t _r = rpos.load();
+        // blocks when the buffer is empty
+        while (wpos.load() == _r)
+            ;
+        // read out the element firstly
+        out = buffer[_r];
+        rpos++;
     }
 
-    bool try_push(const T &p)
+    bool try_push(const T &elem)
     {
-        if ((uint8_t)(wpos.load() + 1) == rpos.load())
+        // only the producer push can update write position
+        uint8_t _w = wpos.load();
+        // blocks when the buffer is full
+        if (uint8_t(_w + 1) == rpos.load())
             return false;
-        buffer[wpos++] = p;
+        // store elem firstly
+        buffer[_w] = elem;
+        // atomic move write position, so that consumer can detect
+        wpos++;
         return true;
     }
 
-    bool try_pop(T &p)
+    bool try_pop(T &out)
     {
-        if (wpos.load() == rpos.load())
+        // only the consumer push can update read position
+        uint8_t _r = rpos.load();
+        // blocks when the buffer is empty
+        if (wpos.load() == _r)
             return false;
-        p = buffer[rpos++];
-        return false;
+        // read out the element firstly
+        out = buffer[_r];
+        rpos++;
+        return true;
     }
 };
 
@@ -88,34 +108,43 @@ public:
         return w > r ? w - r : r - w + CAPACITY;
     }
 
-    void push(const T &ref)
+    void push(const T &elem)
     {
         /// NOTICE: it works as long as arithmetic on unsigned integers keep exhibiting modulo behavior.
-        while (uint32_t(wpos.load() + 1) == rpos.load())
-            ; // blocks when the buffer is full
-        buffer[(wpos++) & CAPACITY_MASK] = ref;
+        uint32_t _w = wpos.load();
+        // blocks when the buffer is full
+        while (uint32_t(_w - rpos.load()) == CAPACITY_MASK)
+            ;
+        buffer[_w & CAPACITY_MASK] = elem;
+        wpos++;
     }
 
-    T pop()
+    void pop(T &out)
     {
-        while (wpos.load() == rpos.load())
+        uint32_t _r = rpos.load();
+        while (wpos.load() == _r)
             ; // blocks when the buffer is empty
-        return buffer[(rpos++) & CAPACITY_MASK];
+        out = buffer[_r & CAPACITY_MASK];
+        rpos++;
     }
 
-    bool try_push(const T &ref)
+    bool try_push(const T &elem)
     {
-        if (uint32_t(wpos.load() + 1) == rpos.load())
+        uint32_t _w = wpos.load();
+        while (uint32_t(_w - rpos.load()) == CAPACITY_MASK)
             return false;
-        buffer[(wpos++) & CAPACITY_MASK] = ref;
+        buffer[_w & CAPACITY_MASK] = elem;
+        wpos++;
         return true;
     }
 
     bool try_pop(T &out)
     {
-        if (wpos.load() == rpos.load())
-            return false;
-        out = buffer[(rpos++) & CAPACITY_MASK];
+        uint32_t _r = rpos.load();
+        if (wpos.load() == _r)
+            return false; // blocks when the buffer is empty
+        out = buffer[_r & CAPACITY_MASK];
+        rpos++;
         return true;
     }
 };
