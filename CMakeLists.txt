@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.0.0)
+
 # set the project name and version
 project(aggregator VERSION 1.0)
 
@@ -23,9 +24,18 @@ add_executable(error_enum_string error_enum_string.cpp)
 
 add_executable(thread_based_lua_vm thread_based_lua_vm.cpp)
 
+add_executable(spsc_queue spsc_queue.cpp)
+
 target_include_directories(
     thread_based_lua_vm
     PUBLIC ${LUAJIT_INCLUDE_DIR}
 )
 
-target_link_libraries(thread_based_lua_vm ${LUAJIT_LIB_DIR})
+target_include_directories(
+    spsc_queue
+    PUBLIC $(CMAKE_CURRENT_SOURCE_DIR)
+)
+
+target_link_libraries(thread_based_lua_vm pthread ${LUAJIT_LIB_DIR})
+
+target_link_libraries(spsc_queue pthread)
