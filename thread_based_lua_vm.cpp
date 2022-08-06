@@ -1,3 +1,23 @@
+
+/*
+  Copyright (c) 2021 Lu Kai
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*/
+
 #include <assert.h>
 #include <unistd.h>
 #include <signal.h>
@@ -17,8 +37,8 @@ public:
         SCRIPTING,
     } STATE;
     STATE GetState() const;
-    int Exec();
-    void UpdateScript();
+    int ResumeThread();
+    void ReloadScript();
 
 private:
     pthread_t tid;
@@ -87,6 +107,7 @@ ThreadedLuaVM *ThreadedLuaVM::Create()
     // manage singal set
     sigemptyset(&vm->mask);
     sigaddset(&vm->mask, SIGUSR1);
+    sigaddset(&vm->mask, SIGUSR2);
     pthread_sigmask(SIG_SETMASK, &vm->mask, NULL);
     // create running thread
     int creat_ret = pthread_create(&vm->tid, &attr, run, vm);
@@ -115,8 +136,6 @@ void dump_vm_stack(lua_State *L)
 
 void ThreadedLuaVM::loop()
 {
-    // loop
-    int sig = 0;
     // lua vm of this thread
     lua_State *vm = NULL;
     for (;;)
@@ -139,32 +158,39 @@ void ThreadedLuaVM::loop()
             luaL_openlibs(vm);
             /// TODO: create sandbox
             // script
-            const char *script =
-                "while true do \
-                    print('[lua] executing') \
-                    coroutine.yield(); \
-                end";
-            luaL_loadstring(vm, script);
+            int ret = luaL_loadfile(vm, "script.lua");
+            std::cout << "[c++ vm] load lua script: " << ret << std::endl;
             // set JIT mode
             luaJIT_setmode(vm, 1, LUAJIT_MODE_ALLFUNC | LUAJIT_MODE_ON);
             // set script flag to false
             nscript = false;
         }
         state.store(IDLE);
-        std::cout << "[c++] begin signal wait " << std::endl;
-        int wret = sigwait(&mask, &sig);
-        if (0 != wret)
+        std::cout << "[c++] wait for resume/reload signal " << std::endl;
+        siginfo_t info;
+        int wret = sigwaitinfo(&mask, &info);
+        if (info.si_pid != getpid())
+        {
+            std::cout << "[c++ vm] ignore signal from another process" << std::endl;
+            continue;
+        }
+        else if (SIGUSR2 == info.si_signo)
         {
             // panic : invalid signal setup
-            std::cout << "[c++] invalid signal setup = " << wret << std::endl;
-            lasterr = SIGSET_INVALID;
-            break;
+            std::cout << "[c++ vm] recv reload signal " << std::endl;
+            continue;
+        }
+        std::cout << "[c++ vm] recv resume signal " << std::endl;
+        if (-1 == wret)
+        {
+            // panic : invalid signal setup
+            std::cout << "[c++ vm] sigwaitinfo error = " << errno << std::endl;
+            continue;
         }
         // set state to 'SCRIPTING'
         state.store(SCRIPTING);
         // resume the script with 0 argument
         int ret = lua_resume(vm, 0);
-        std::cout << "[c++] vm status = " << lua_status(vm) << std::endl;
         if (LUA_YIELD == ret)
         {
             // good script
@@ -173,7 +199,18 @@ void ThreadedLuaVM::loop()
         else
         {
             // bad script
-            lasterr = (0 == ret) ? BADSCRIPT_MUST_YIELD : BADSCRIPT_RUNTIME_ERROR;
+            if (0 == ret)
+            {
+                lasterr = BADSCRIPT_MUST_YIELD;
+                std::cout << "[c++] " << LastError() << std::endl;
+            }
+            else
+            {
+                lasterr = BADSCRIPT_RUNTIME_ERROR;
+                std::cout << "[c++] " << LastError() << std::endl;
+                std::cout << "lua runtime error :" << std::endl
+                          << lua_tostring(vm, lua_gettop(vm)) << std::endl;
+            }
             break;
         }
     }
@@ -185,11 +222,10 @@ ThreadedLuaVM::STATE ThreadedLuaVM::GetState() const
     return state.load();
 }
 
-int ThreadedLuaVM::Exec()
+int ThreadedLuaVM::ResumeThread()
 {
     /// TODO: send via message queue
     STATE s = GetState();
-    std::cout << "state is:" << s << std::endl;
     if (IDLE == s)
     {
         return pthread_kill(tid, SIGUSR1);
@@ -198,26 +234,65 @@ int ThreadedLuaVM::Exec()
     return -1;
 }
 
-void ThreadedLuaVM::UpdateScript()
+void ThreadedLuaVM::ReloadScript()
 {
     // boolean value update is thread safe
     nscript = true;
+    pthread_kill(tid, SIGUSR2);
+}
+
+/* main area */
+
+static volatile sig_atomic_t run = 1;
+
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    run = 0;
+    fclose(stdin);
 }
 
 int main(int argc, char **argv)
 {
     ThreadedLuaVM *vm = ThreadedLuaVM::Create();
-    for (;;)
+    signal(SIGINT, sigint_handler);
+
+    const char *helpmsg = "%% Type '?' then Enter to print this message once again \n"
+                          "%% Type 'c' then Enter to resume the Lua VM thread \n"
+                          "%% Type 'r' then Enter to reload the Lua script \n"
+                          "%% Press Ctrl-C or Ctrl-D to exit\n";
+
+    std::cerr << helpmsg << std::endl;
+    char buf[128];
+    while (run && fgets(buf, sizeof(buf), stdin))
     {
-        sleep(1);
-        int exec_ret = vm->Exec();
-        if (-1 == exec_ret)
+        size_t len = strlen(buf);
+        // remove newline
+        if ('\n' == buf[len - 1])
+            buf[--len] = '\0';
+
+        if (1 == len)
         {
-            std::cout << "attempt exec failed, ThreadedLuaVM is running" << std::endl;
+            switch (buf[0])
+            {
+            case '?':
+                // print once again
+                std::cerr << helpmsg << std::endl;
+                break;
+            case 'c':
+                vm->ResumeThread();
+                break;
+            case 'r':
+                vm->ReloadScript();
+                break;
+            default:
+                std::cerr << "[c++ main] unkown option :" << buf << std::endl;
+                break;
+            }
         }
         else
         {
-            std::cout << "attempt exec success :" << exec_ret << std::endl;
+            std::cerr << "[c++ main] option string too " << (len ? "long" : "short") << ": " << buf << std::endl;
         }
     }
     return 0;

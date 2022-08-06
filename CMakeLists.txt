@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0.0)
 
 # set the project name and version
-project(aggregator VERSION 1.0)
+project(cxxtricks VERSION 1.0)
 
 # specify the C standard
 set(CMAKE_C_STANDARD 99)
